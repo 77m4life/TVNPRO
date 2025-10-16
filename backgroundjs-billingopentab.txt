@@ -1,0 +1,475 @@
+// Background script để xử lý mở, đóng tabs và highlight tự động
+
+// ========== PHẦN XỬ LÝ TAB MANAGER ==========
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === 'openTabs') {
+        handleOpenTabs(request.urls, request.delay, request.batchSize)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+    }
+    
+    if (request.action === 'closeTabs') {
+        handleCloseTabs(request.maxTabs)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+    }
+    
+    if (request.action === 'checkTabs') {
+        handleCheckTabs()
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+    }
+    
+    if (request.action === 'activateTab') {
+        handleActivateTab(request.tabId)
+            .then(result => sendResponse(result))
+            .catch(error => sendResponse({ success: false, error: error.message }));
+        return true;
+    }
+});
+
+async function handleOpenTabs(urls, delay, batchSize) {
+    try {
+        const startTime = Date.now();
+        let openedCount = 0;
+        const totalCount = urls.length;
+
+        // Lấy tab hiện tại để xác định vị trí chèn tab mới
+        const currentTabs = await chrome.tabs.query({ active: true, currentWindow: true });
+        const currentTab = currentTabs[0];
+        
+        if (!currentTab) {
+            throw new Error('Không tìm thấy tab hiện tại');
+        }
+
+        // Index của tab hiện tại, các tab mới sẽ được chèn sau tab này
+        const currentTabIndex = currentTab.index;
+
+        // Mở các tab theo batch
+        for (let batchStart = 0; batchStart < totalCount; batchStart += batchSize) {
+            const batchEnd = Math.min(batchStart + batchSize, totalCount);
+            const batchPromises = [];
+
+            // Tạo promises cho batch hiện tại
+            for (let i = batchStart; i < batchEnd; i++) {
+                const openPromise = new Promise((resolve) => {
+                    setTimeout(async () => {
+                        try {
+                            // Mở tab mới trong background (không kích hoạt) và chèn SAU tab hiện tại
+                            await chrome.tabs.create({
+                                url: urls[i],
+                                active: false,
+                                index: currentTabIndex + 1 + i // Chèn sau tab hiện tại
+                            });
+                            
+                            openedCount++;
+                            resolve();
+                        } catch (error) {
+                            console.error(`Lỗi khi mở tab ${urls[i]}:`, error);
+                            // Thử mở tab mà không chỉ định index nếu có lỗi
+                            try {
+                                await chrome.tabs.create({
+                                    url: urls[i],
+                                    active: false
+                                });
+                                openedCount++;
+                            } catch (e) {
+                                console.error('Lỗi khi mở tab dự phòng:', e);
+                            }
+                            resolve();
+                        }
+                    }, i * delay);
+                });
+                
+                batchPromises.push(openPromise);
+            }
+
+            // Chờ batch hiện tại hoàn thành
+            await Promise.all(batchPromises);
+
+            // Nghỉ ngắn giữa các batch để tránh quá tải
+            if (batchEnd < totalCount) {
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+        }
+
+        const endTime = Date.now();
+        const duration = (endTime - startTime) / 1000;
+
+        // KIỂM TRA VÀ KÍCH HOẠT HIGHLIGHT SAU KHI MỞ TAB
+        setTimeout(() => {
+            checkAndHighlightTabs();
+        }, 1000);
+
+        return {
+            success: true,
+            openedCount: openedCount,
+            duration: duration
+        };
+
+    } catch (error) {
+        console.error('Lỗi khi mở tabs:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+async function handleCloseTabs(maxTabs) {
+    try {
+        // Lấy tất cả các tab đang mở
+        const tabs = await chrome.tabs.query({});
+        const accountTabs = tabs.filter(tab => 
+            tab.url && tab.url.includes('ads.google.com') && !tab.active
+        );
+        
+        const closeCount = Math.min(accountTabs.length, maxTabs);
+        
+        if (closeCount === 0) {
+            return { 
+                success: false, 
+                error: 'Không tìm thấy tab tài khoản nào để đóng!' 
+            };
+        }
+        
+        const startTime = Date.now();
+        
+        // Đóng các tab theo batch
+        const BATCH_SIZE = 8;
+        let closedCount = 0;
+        
+        for (let i = 0; i < closeCount; i += BATCH_SIZE) {
+            const batch = accountTabs.slice(i, i + BATCH_SIZE);
+            const tabIds = batch.map(tab => tab.id);
+            
+            await chrome.tabs.remove(tabIds);
+            closedCount += batch.length;
+            
+            // Nghỉ ngắn giữa các batch
+            if (i + BATCH_SIZE < closeCount) {
+                await new Promise(resolve => setTimeout(resolve, 20));
+            }
+        }
+        
+        const endTime = Date.now();
+        const duration = (endTime - startTime) / 1000;
+        
+        // KIỂM TRA LẠI SAU KHI ĐÓNG TAB
+        setTimeout(() => {
+            checkAndHighlightTabs();
+        }, 500);
+        
+        return {
+            success: true,
+            closedCount: closedCount,
+            duration: duration
+        };
+        
+    } catch (error) {
+        console.error('Lỗi khi đóng tabs:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+async function handleCheckTabs() {
+    try {
+        // Lấy tất cả các tab đang mở
+        const tabs = await chrome.tabs.query({});
+        
+        let completedAccounts = 0; // Tài khoản đã hoàn thành
+        let incompleteAccounts = 0; // Tài khoản chưa hoàn thành
+        const incompletePositions = []; // Vị trí tab chưa hoàn thành
+        const incompleteTabs = []; // Thông tin chi tiết tab chưa hoàn thành
+        
+        tabs.forEach(tab => {
+            if (tab.url && tab.url.includes('ads.google.com')) {
+                if (tab.url.includes('/billing/pending') || tab.url.includes('/billing/summary')) {
+                    // Tài khoản đã hoàn thành
+                    completedAccounts++;
+                } else if (tab.url.includes('/billing/signup')) {
+                    // Tài khoản chưa hoàn thành
+                    incompleteAccounts++;
+                    // Thêm vị trí tab (tính từ tab thứ 2 là tab 1)
+                    if (tab.index >= 1) {
+                        incompletePositions.push(tab.index);
+                        incompleteTabs.push({
+                            id: tab.id,
+                            index: tab.index,
+                            url: tab.url
+                        });
+                    }
+                }
+            }
+        });
+        
+        // Sắp xếp vị trí tăng dần
+        incompletePositions.sort((a, b) => a - b);
+        incompleteTabs.sort((a, b) => a.index - b.index);
+        
+        return {
+            success: true,
+            completedAccounts: completedAccounts,
+            incompleteAccounts: incompleteAccounts,
+            incompletePositions: incompletePositions,
+            incompleteTabs: incompleteTabs
+        };
+        
+    } catch (error) {
+        console.error('Lỗi khi kiểm tra tabs:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+async function handleActivateTab(tabId) {
+    try {
+        // Kích hoạt tab và đưa lên foreground
+        await chrome.tabs.update(tabId, { active: true });
+        
+        // Đưa cửa sổ lên foreground
+        const tab = await chrome.tabs.get(tabId);
+        await chrome.windows.update(tab.windowId, { focused: true });
+        
+        return {
+            success: true,
+            message: `Đã kích hoạt tab ${tabId}`
+        };
+        
+    } catch (error) {
+        console.error('Lỗi khi kích hoạt tab:', error);
+        return {
+            success: false,
+            error: error.message
+        };
+    }
+}
+
+// ========== PHẦN HIGHLIGHT TỰ ĐỘNG ==========
+
+// Biến để tránh xử lý trùng lặp
+let isProcessing = false;
+let processingPromise = null;
+
+// Debounce để tránh xử lý quá nhiều lần
+function debounce(func, wait) {
+  let timeout;
+  return function executedFunction(...args) {
+    const later = () => {
+      clearTimeout(timeout);
+      func(...args);
+    };
+    clearTimeout(timeout);
+    timeout = setTimeout(later, wait);
+  };
+}
+
+// Xử lý sự kiện tabs với debounce
+const debouncedCheck = debounce(async () => {
+  await checkAndHighlightTabs();
+}, 300);
+
+// ĐĂNG KÝ SỰ KIỆN NGAY KHI EXTENSION LOAD
+function initializeEventListeners() {
+  console.log('TVNPRO: Initializing tab event listeners...');
+  
+  chrome.tabs.onCreated.addListener(() => {
+    debouncedCheck();
+  });
+
+  chrome.tabs.onRemoved.addListener(() => {
+    debouncedCheck();
+  });
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+    if (changeInfo.status === 'complete') {
+      debouncedCheck();
+    }
+  });
+
+  chrome.tabs.onMoved.addListener(() => {
+    debouncedCheck();
+  });
+
+  chrome.tabGroups.onUpdated.addListener(() => {
+    debouncedCheck();
+  });
+}
+
+// Kiểm tra và highlight tabs khi có đủ 26 tab
+async function checkAndHighlightTabs() {
+  // Tránh xử lý trùng lặp
+  if (isProcessing) {
+    if (processingPromise) {
+      await processingPromise;
+    }
+    return;
+  }
+
+  isProcessing = true;
+  
+  try {
+    processingPromise = processHighlighting();
+    await processingPromise;
+  } catch (error) {
+    console.error('TVNPRO: Error in highlight process:', error);
+  } finally {
+    isProcessing = false;
+    processingPromise = null;
+  }
+}
+
+async function processHighlighting() {
+  const allTabs = await chrome.tabs.query({});
+  console.log(`TVNPRO: Current tab count: ${allTabs.length}`);
+  
+  // Chỉ thực hiện khi có đúng 26 tab
+  if (allTabs.length === 26) {
+    console.log('TVNPRO: 26 tabs detected, starting highlight process...');
+    await highlightImportantTabs(allTabs);
+  } else {
+    // Nếu không đúng 26 tab, có thể xóa badge nếu muốn
+    await clearHighlights(allTabs);
+  }
+}
+
+// Hàm highlight các tab quan trọng
+async function highlightImportantTabs(allTabs) {
+  // Danh sách tab cần highlight (index từ 0)
+  const highlightIndexes = [1, 7, 13, 19];
+  
+  // Màu sắc nổi bật với độ tương phản cao
+  const colors = [
+    '#FF3B30', // Đỏ tươi
+    '#4CD964', // Xanh lá sáng
+    '#007AFF', // Xanh dương đậm
+    '#FFCC00'  // Vàng vàng
+  ];
+  
+  // Tên group với số thứ tự nổi bật
+  const groupNames = ["❶", "❷", "❸", "❹"];
+  
+  console.log(`TVNPRO: Highlighting tabs at indexes: ${highlightIndexes.join(', ')}`);
+  
+  for (let i = 0; i < highlightIndexes.length; i++) {
+    const tabIndex = highlightIndexes[i];
+    
+    // Kiểm tra xem tab index có tồn tại không
+    if (tabIndex < allTabs.length && allTabs[tabIndex]) {
+      const tab = allTabs[tabIndex];
+      
+      try {
+        // Thử sử dụng tab groups trước
+        await highlightWithGroup(tab, groupNames[i], i);
+      } catch (groupError) {
+        console.log(`TVNPRO: Group failed for tab ${tabIndex}, using badge fallback:`, groupError);
+        // Fallback: dùng badge
+        await highlightWithBadge(tab, i + 1, colors[i]);
+      }
+    } else {
+      console.warn(`TVNPRO: Tab index ${tabIndex} is out of bounds (total tabs: ${allTabs.length})`);
+    }
+  }
+}
+
+// Highlight sử dụng tab groups
+async function highlightWithGroup(tab, groupName, colorIndex) {
+  // Kiểm tra xem API có khả dụng không
+  if (!chrome.tabGroups || !chrome.tabs.group) {
+    throw new Error('Tab Groups API not available');
+  }
+
+  let groupId = tab.groupId;
+  
+  // Nếu tab chưa có group hoặc group không tồn tại
+  if (groupId === -1) {
+    // Tạo group mới
+    groupId = await chrome.tabs.group({
+      tabIds: tab.id
+    });
+    console.log(`TVNPRO: Created new group ${groupId} for tab ${tab.id}`);
+  }
+  
+  // Cập nhật thông tin group
+  await chrome.tabGroups.update(groupId, {
+    title: groupName,
+    color: getGroupColor(colorIndex)
+  });
+  
+  console.log(`TVNPRO: Tab ${tab.id} highlighted in group ${groupId}`);
+}
+
+// Highlight sử dụng badge (fallback)
+async function highlightWithBadge(tab, number, color) {
+  try {
+    await chrome.action.setBadgeText({
+      tabId: tab.id,
+      text: number.toString()
+    });
+    await chrome.action.setBadgeBackgroundColor({
+      tabId: tab.id,
+      color: color
+    });
+    console.log(`TVNPRO: Tab ${tab.id} highlighted with badge ${number}`);
+  } catch (error) {
+    console.error(`TVNPRO: Failed to set badge for tab ${tab.id}:`, error);
+  }
+}
+
+// Xóa highlight khi không còn 26 tab (tùy chọn)
+async function clearHighlights(allTabs) {
+  // Chỉ xóa badge, giữ nguyên groups
+  for (const tab of allTabs) {
+    try {
+      await chrome.action.setBadgeText({
+        tabId: tab.id,
+        text: ''
+      });
+    } catch (error) {
+      // Bỏ qua lỗi
+    }
+  }
+}
+
+function getGroupColor(index) {
+  const colors = ["red", "green", "blue", "yellow"];
+  return colors[index] || "blue";
+}
+
+// KHỞI TẠO NGAY KHI EXTENSION BẮT ĐẦU
+console.log('TVNPRO: Extension loading...');
+
+// Khởi tạo event listeners ngay lập tức
+initializeEventListeners();
+
+// Kiểm tra tabs ngay khi extension khởi động
+chrome.runtime.onStartup.addListener(() => {
+  console.log('TVNPRO: Extension started, checking tabs...');
+  debouncedCheck();
+});
+
+chrome.runtime.onInstalled.addListener((details) => {
+  console.log('TVNPRO: Extension installed/updated, checking tabs...');
+  
+  // Khởi tạo event listeners
+  initializeEventListeners();
+  
+  // Kiểm tra tabs ngay lập tức
+  setTimeout(() => {
+    debouncedCheck();
+  }, 1000);
+});
+
+// KIỂM TRA NGAY KHI LOAD
+setTimeout(() => {
+  console.log('TVNPRO: Initial tab check...');
+  debouncedCheck();
+}, 500);
